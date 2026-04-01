@@ -9,7 +9,7 @@ import winreg
 import webbrowser
 
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import pystray
 from PIL import Image
@@ -100,18 +100,40 @@ class ArgumentManager:
 # ─── Server Process Manager ──────────────────────────────────────────────────
 
 class ServerManager:
-    def __init__(self, exe_path: Path, arg_mgr: ArgumentManager):
+    def __init__(
+        self,
+        exe_path: Path,
+        arg_mgr: ArgumentManager,
+        on_state_change: Optional[Callable[[bool], None]] = None
+    ):
         self.exe_path = exe_path
         self.arg_mgr = arg_mgr
         self.process: Optional[subprocess.Popen] = None
+        self.on_state_change = on_state_change
+
+    def set_state_callback(self, callback: Callable[[bool], None]) -> None:
+        self.on_state_change = callback
+
+    def is_running(self) -> bool:
+        return self.process is not None and self.process.poll() is None
+
+    def _notify_state(self) -> None:
+        if self.on_state_change is None:
+            return
+        try:
+            self.on_state_change(self.is_running())
+        except Exception:
+            logging.exception("Failed to update tray icon state")
 
     def start(self) -> None:
-        if self.process and self.process.poll() is None:
+        if self.is_running():
             logging.info("UxPlay server already running (PID %s)", self.process.pid)
+            self._notify_state()
             return
 
         if not self.exe_path.exists():
             logging.error("uxplay.exe not found at %s", self.exe_path)
+            self._notify_state()
             return
 
         cmd = [str(self.exe_path)] + self.arg_mgr.read_args()
@@ -122,12 +144,15 @@ class ServerManager:
                 creationflags=subprocess.CREATE_NO_WINDOW
             )
             logging.info("Started UxPlay (PID %s)", self.process.pid)
+            self._notify_state()
         except Exception:
             logging.exception("Failed to launch UxPlay")
+            self._notify_state()
 
     def stop(self) -> None:
-        if not (self.process and self.process.poll() is None):
+        if not self.is_running():
             logging.info("UxPlay server not running.")
+            self._notify_state()
             return
 
         pid = self.process.pid
@@ -144,6 +169,7 @@ class ServerManager:
             logging.exception("Error stopping UxPlay")
         finally:
             self.process = None
+            self._notify_state()
 
 # ─── Auto-Start Manager ───────────────────────────────────────────────────────
 
@@ -223,10 +249,13 @@ class TrayIcon:
         self.server_mgr = server_mgr
         self.arg_mgr = arg_mgr
         self.auto_mgr = auto_mgr
+        with Image.open(icon_path) as img:
+            self.idle_icon_image = img.convert("RGBA")
+        self.active_icon_image = self._make_active_icon(self.idle_icon_image)
 
         menu = pystray.Menu(
-            pystray.MenuItem("Start UxPlay", lambda _: server_mgr.start()),
-            pystray.MenuItem("Stop UxPlay",  lambda _: server_mgr.stop()),
+            pystray.MenuItem("Start UxPlay", lambda _: self.server_mgr.start()),
+            pystray.MenuItem("Stop UxPlay",  lambda _: self.server_mgr.stop()),
             pystray.MenuItem("Restart UxPlay", lambda _: self._restart()),
             pystray.MenuItem(
                 "Autostart with Windows",
@@ -249,10 +278,28 @@ class TrayIcon:
 
         self.icon = pystray.Icon(
             name=f"{APP_NAME}\nRight-click to configure.",
-            icon=Image.open(icon_path),
+            icon=self.idle_icon_image,
             title=APP_NAME,
             menu=menu
         )
+
+    @staticmethod
+    def _make_active_icon(base_image: Image.Image) -> Image.Image:
+        rgba = base_image.convert("RGBA")
+        pixels = rgba.load()
+        width, height = rgba.size
+        for y in range(height):
+            for x in range(width):
+                red, green, blue, alpha = pixels[x, y]
+                if alpha == 0:
+                    continue
+                # Keep perceived icon shading while making active state clearly green.
+                brightness = max(red, green, blue)
+                pixels[x, y] = (0, brightness, 0, alpha)
+        return rgba
+
+    def set_server_state(self, running: bool) -> None:
+        self.icon.icon = self.active_icon_image if running else self.idle_icon_image
 
     def _restart(self):
         logging.info("Restarting UxPlay")
@@ -273,6 +320,7 @@ class TrayIcon:
         self.icon.stop()
 
     def run(self):
+        self.set_server_state(self.server_mgr.is_running())
         self.icon.run()
 
 # ─── Application Orchestration ───────────────────────────────────────────────
@@ -297,6 +345,7 @@ class Application:
             self.arg_mgr,
             self.auto_mgr
         )
+        self.server_mgr.set_state_callback(self.tray.set_server_state)
 
     def run(self):
         self.arg_mgr.ensure_exists()
